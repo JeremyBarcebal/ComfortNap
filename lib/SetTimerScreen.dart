@@ -3,7 +3,6 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'ble_man.dart';
 import 'dart:async';
-import 'dart:ui';
 
 class SetTimerScreen extends StatefulWidget {
   const SetTimerScreen({super.key});
@@ -14,8 +13,23 @@ class SetTimerScreen extends StatefulWidget {
 
 class _SetTimerScreenState extends State<SetTimerScreen> {
   double selectedLevel = 0.5;
-  double heatLevel = 38.0; // °C, matches the range used on the home screen
+  double heatLevel = 50.0;
   bool isLocked = false;
+
+  static const List<double> _heatLevels = [0.0, 25.0, 50.0, 75.0, 100.0];
+
+  double _snapHeatLevel(double value) {
+    double closest = _heatLevels.first;
+
+    for (final level in _heatLevels.skip(1)) {
+      if ((value - level).abs() < (value - closest).abs()) {
+        closest = level;
+      }
+    }
+
+    return closest;
+  }
+
   int remainingSeconds = 0;
   Timer? countdownTimer;
   Timer? autoFinishTimer; // cancellable replacement for the old Future.delayed
@@ -73,6 +87,7 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
     await BLEManager.instance.send("ON");
     await Future.delayed(const Duration(milliseconds: 200));
     await BLEManager.instance.send("VIB:${levelPercent}");
+    await BLEManager.instance.send("HEAT:${heatLevel.round()}");
     countdownTimer?.cancel();
 
     countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
@@ -327,28 +342,43 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
               Expanded(
                 child: Slider(
                   value: heatLevel,
-                  min: 20,
-                  max: 50,
+                  min: 0,
+                  max: 100,
+                  divisions: 4,
                   activeColor: Colors.orange,
                   inactiveColor: Colors.orange.withValues(alpha: 0.4),
-
-                  // Only stored as metadata for now — the ESP32 firmware's
-                  // HEAT_ON/HEAT_OFF commands don't support a temperature
-                  // level yet, same as the home-screen heat slider.
                   onChanged: isLocked
                       ? null
-                      : (val) {
+                      : (val) async {
+                          final selectedHeat = _snapHeatLevel(val);
                           setState(() {
-                            heatLevel = val;
+                            heatLevel = selectedHeat;
                           });
+
+                          if (BLEManager.instance.connected) {
+                            await BLEManager.instance.send(
+                              "HEAT:${selectedHeat.round()}",
+                            );
+                          }
                         },
                 ),
               ),
 
               Text(
-                "${heatLevel.round()}°C",
+                "${heatLevel.round()}",
                 style: GoogleFonts.poppins(color: Colors.white),
               ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: const [
+              Text("0", style: TextStyle(color: Colors.white70)),
+              Text("25", style: TextStyle(color: Colors.white70)),
+              Text("50", style: TextStyle(color: Colors.white70)),
+              Text("75", style: TextStyle(color: Colors.white70)),
+              Text("100", style: TextStyle(color: Colors.white70)),
             ],
           ),
         ],

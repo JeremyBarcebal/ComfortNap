@@ -47,8 +47,24 @@ class ComfortNapScreen extends StatefulWidget {
 
 class _ComfortNapScreenState extends State<ComfortNapScreen> {
   double vibrationLevel = 0.6;
-  double heatLevel = 38.0;
+  double heatLevel = 50.0;
+  double pillowTemperature = 0.0;
+  bool hasPillowTemperature = false;
   double musicVolume = 0.6;
+
+  static const List<double> _heatLevels = [0.0, 25.0, 50.0, 75.0, 100.0];
+
+  double _snapHeatLevel(double value) {
+    double closest = _heatLevels.first;
+
+    for (final level in _heatLevels.skip(1)) {
+      if ((value - level).abs() < (value - closest).abs()) {
+        closest = level;
+      }
+    }
+
+    return closest;
+  }
 
   bool bleConnected = false;
 
@@ -77,6 +93,16 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
       if (mounted) {
         setState(() {
           bleConnected = isConnected;
+        });
+      }
+    });
+
+    // ================= PILLOW TEMP STREAM =================
+    BLEManager.instance.temperatureStream.listen((temp) {
+      if (mounted) {
+        setState(() {
+          pillowTemperature = temp;
+          hasPillowTemperature = true;
         });
       }
     });
@@ -359,19 +385,84 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
                 const SizedBox(height: 16),
 
                 // ================= HEAT =================
-                _buildSliderTile(
-                  title: "Heat Level",
-                  icon: Icons.thermostat,
-                  color: Colors.orange,
-                  value: heatLevel,
-                  min: 20,
-                  max: 50,
-                  label: "${heatLevel.round()}°C",
-                  onChanged: (val) {
-                    setState(() {
-                      heatLevel = val;
-                    });
-                  },
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E1B48),
+                    borderRadius: BorderRadius.circular(15),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            "Heat Level",
+                            style: GoogleFonts.poppins(
+                              color: Colors.white,
+                              fontSize: 18,
+                            ),
+                          ),
+                          Text(
+                            hasPillowTemperature
+                                ? "Pillow ${pillowTemperature.toStringAsFixed(1)}°C"
+                                : "Pillow --°C",
+                            style: GoogleFonts.poppins(
+                              color: Colors.orangeAccent,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          const Icon(Icons.thermostat, color: Colors.orange),
+                          Expanded(
+                            child: Slider(
+                              value: heatLevel,
+                              min: 0,
+                              max: 100,
+                              divisions: 4,
+                              activeColor: Colors.orange,
+                              inactiveColor: Colors.orange.withValues(
+                                alpha: 0.4,
+                              ),
+                              onChanged: (val) async {
+                                final selectedHeat = _snapHeatLevel(val);
+                                setState(() {
+                                  heatLevel = selectedHeat;
+                                });
+
+                                if (BLEManager.instance.connected) {
+                                  await BLEManager.instance.send(
+                                    "HEAT:${selectedHeat.round()}",
+                                  );
+                                }
+                              },
+                            ),
+                          ),
+                          Text(
+                            "${heatLevel.round()}",
+                            style: GoogleFonts.poppins(color: Colors.white),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: const [
+                          Text("0%", style: TextStyle(color: Colors.white70)),
+                          Text("25%", style: TextStyle(color: Colors.white70)),
+                          Text("50%", style: TextStyle(color: Colors.white70)),
+                          Text("75%", style: TextStyle(color: Colors.white70)),
+                          Text("100%", style: TextStyle(color: Colors.white70)),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
 
                 const SizedBox(height: 16),
@@ -533,6 +624,9 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
                       sessionStartTime = DateTime.now();
 
                       await BLEManager.instance.send("ON");
+                      await BLEManager.instance.send(
+                        "HEAT:${heatLevel.round()}",
+                      );
 
                       final docRef = await FirebaseFirestore.instance
                           .collection("vibrator_logs")
@@ -747,55 +841,6 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
             ),
           ),
         ),
-      ),
-    );
-  }
-
-  Widget _buildSliderTile({
-    required String title,
-    required IconData icon,
-    required Color color,
-    required double value,
-    required double min,
-    required double max,
-    required String label,
-    required Function(double) onChanged,
-  }) {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1E1B48),
-        borderRadius: BorderRadius.circular(15),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: GoogleFonts.poppins(color: Colors.white, fontSize: 18),
-          ),
-
-          const SizedBox(height: 8),
-
-          Row(
-            children: [
-              Icon(icon, color: color),
-
-              Expanded(
-                child: Slider(
-                  value: value,
-                  min: min,
-                  max: max,
-                  activeColor: color,
-                  inactiveColor: color.withValues(alpha: 0.4),
-                  onChanged: onChanged,
-                ),
-              ),
-
-              Text(label, style: GoogleFonts.poppins(color: Colors.white)),
-            ],
-          ),
-        ],
       ),
     );
   }

@@ -157,6 +157,9 @@ class BLEManager {
   final _sleepStream = StreamController<String>.broadcast();
   Stream<String> get sleepStream => _sleepStream.stream;
 
+  final _temperatureStream = StreamController<double>.broadcast();
+  Stream<double> get temperatureStream => _temperatureStream.stream;
+
   // ================= UUID =================
   static const serviceUUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
   static const txUUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
@@ -180,7 +183,6 @@ class BLEManager {
     for (var s in services) {
       if (s.uuid.toString().toUpperCase() == serviceUUID) {
         for (var c in s.characteristics) {
-
           // ================= TX (NOTIFY FROM ESP32) =================
           if (c.uuid.toString().toUpperCase() == txUUID) {
             _tx = c;
@@ -194,7 +196,20 @@ class BLEManager {
               if (msg == "EXTEND_REQUEST") {
                 _extendCallback?.call();
               }
+              // ================= PILLOW TEMPERATURE =================
+              else if (msg.startsWith("TEMP:") ||
+                  msg.startsWith("PILLOW_TEMP:")) {
+                final raw = msg.contains(":")
+                    ? msg.split(":").sublist(1).join(":")
+                    : msg;
 
+                try {
+                  final temperature = double.parse(raw);
+                  _temperatureStream.add(temperature);
+                } catch (_) {
+                  print("INVALID TEMP PAYLOAD: $msg");
+                }
+              }
               // ================= SLEEP DATA =================
               else if (msg.startsWith("SLEEP:")) {
                 _sleepStream.add(msg);
@@ -240,5 +255,6 @@ class BLEManager {
   void dispose() {
     _stream.close();
     _sleepStream.close();
+    _temperatureStream.close();
   }
 }
