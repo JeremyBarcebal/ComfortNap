@@ -1,11 +1,29 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'ble_man.dart';
-import 'dart:async';
+
+class SessionTimerSettings {
+  const SessionTimerSettings({
+    required this.durationSeconds,
+    required this.vibrationLevel,
+    required this.heatLevel,
+  });
+
+  final int durationSeconds;
+  final double vibrationLevel;
+  final double heatLevel;
+}
 
 class SetTimerScreen extends StatefulWidget {
-  const SetTimerScreen({super.key});
+  const SetTimerScreen({
+    super.key,
+    this.initialVibrationLevel = 0.5,
+    this.initialHeatLevel = 50.0,
+    this.initialDurationSeconds,
+  });
+
+  final double initialVibrationLevel;
+  final double initialHeatLevel;
+  final int? initialDurationSeconds;
 
   @override
   State<SetTimerScreen> createState() => _SetTimerScreenState();
@@ -14,9 +32,17 @@ class SetTimerScreen extends StatefulWidget {
 class _SetTimerScreenState extends State<SetTimerScreen> {
   double selectedLevel = 0.5;
   double heatLevel = 50.0;
-  bool isLocked = false;
+  int? selectedDurationSeconds;
 
   static const List<double> _heatLevels = [0.0, 25.0, 50.0, 75.0, 100.0];
+
+  @override
+  void initState() {
+    super.initState();
+    selectedLevel = widget.initialVibrationLevel;
+    heatLevel = widget.initialHeatLevel;
+    selectedDurationSeconds = widget.initialDurationSeconds;
+  }
 
   double _snapHeatLevel(double value) {
     double closest = _heatLevels.first;
@@ -28,100 +54,6 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
     }
 
     return closest;
-  }
-
-  int remainingSeconds = 0;
-  Timer? countdownTimer;
-  Timer? autoFinishTimer; // cancellable replacement for the old Future.delayed
-  String? currentLogId;
-  DateTime? sessionStartTime;
-  int originalDuration = 0;
-
-  @override
-  void dispose() {
-    countdownTimer?.cancel();
-    autoFinishTimer?.cancel();
-    super.dispose();
-  }
-
-  // ================= TIMER FUNCTION =================
-  Future<void> sendTimer(int seconds) async {
-    if (!BLEManager.instance.connected) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text("Device not connected")));
-      return;
-    }
-
-    setState(() {
-      isLocked = true;
-      remainingSeconds = seconds;
-      originalDuration = seconds;
-    });
-
-    sessionStartTime = DateTime.now();
-
-    final levelPercent = (selectedLevel * 100).round();
-
-    final startTime = DateTime.now();
-    final endTime = startTime.add(Duration(seconds: seconds));
-
-    final docRef = await FirebaseFirestore.instance
-        .collection("vibrator_logs")
-        .add({
-          "type": "timer",
-          "status": "running",
-          "set_time": Timestamp.fromDate(startTime),
-          "end_time": Timestamp.fromDate(endTime),
-          "duration": seconds,
-          "vibration_level": levelPercent,
-          "heat_level": heatLevel.round(),
-          "timestamp": FieldValue.serverTimestamp(),
-        });
-    currentLogId = docRef.id;
-
-    // 🔥 DEBUG (check if sending)
-    print("BLE SEND: VIB,$seconds,$levelPercent");
-
-    // 🔥 FIXED FORMAT (common Arduino/ESP32 readable format)
-    await BLEManager.instance.send("ON");
-    await Future.delayed(const Duration(milliseconds: 200));
-    await BLEManager.instance.send("VIB:${levelPercent}");
-    await BLEManager.instance.send("HEAT:${heatLevel.round()}");
-    countdownTimer?.cancel();
-
-    countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (remainingSeconds > 0) {
-        setState(() {
-          remainingSeconds--;
-        });
-      } else {
-        timer.cancel();
-      }
-    });
-
-    // 🔥 Auto-finish when the timer naturally reaches zero.
-    // Uses a cancellable Timer (not Future.delayed) so STOP TIMER can
-    // actually prevent this from firing later and clobbering the
-    // "cancelled" status / resetting a newer session's UI state.
-    autoFinishTimer?.cancel();
-    autoFinishTimer = Timer(Duration(seconds: seconds), () async {
-      await BLEManager.instance.send("OFF");
-
-      await FirebaseFirestore.instance
-          .collection("vibrator_logs")
-          .doc(docRef.id)
-          .update({"status": "ended"});
-
-      countdownTimer?.cancel();
-
-      if (mounted) {
-        setState(() {
-          isLocked = false;
-          remainingSeconds = 0;
-        });
-      }
-    });
   }
 
   // ================= CUSTOM TIMER =================
@@ -250,9 +182,11 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
                     if (totalSeconds <= 0) return;
 
                     Navigator.pop(context);
-                    sendTimer(totalSeconds);
+                    setState(() {
+                      selectedDurationSeconds = totalSeconds;
+                    });
                   },
-                  child: const Text("Start"),
+                  child: const Text("Select"),
                 ),
               ],
             );
@@ -291,19 +225,11 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
                   activeColor: Colors.blue,
                   inactiveColor: Colors.blue.withValues(alpha: 0.4),
 
-                  onChanged: isLocked
-                      ? null
-                      : (val) async {
-                          setState(() {
-                            selectedLevel = val;
-                          });
-
-                          if (BLEManager.instance.connected) {
-                            await BLEManager.instance.send(
-                              "VIB:${(val * 100).round()}",
-                            );
-                          }
-                        },
+                  onChanged: (val) {
+                    setState(() {
+                      selectedLevel = val;
+                    });
+                  },
                 ),
               ),
 
@@ -347,20 +273,12 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
                   divisions: 4,
                   activeColor: Colors.orange,
                   inactiveColor: Colors.orange.withValues(alpha: 0.4),
-                  onChanged: isLocked
-                      ? null
-                      : (val) async {
-                          final selectedHeat = _snapHeatLevel(val);
-                          setState(() {
-                            heatLevel = selectedHeat;
-                          });
-
-                          if (BLEManager.instance.connected) {
-                            await BLEManager.instance.send(
-                              "HEAT:${selectedHeat.round()}",
-                            );
-                          }
-                        },
+                  onChanged: (val) {
+                    final selectedHeat = _snapHeatLevel(val);
+                    setState(() {
+                      heatLevel = selectedHeat;
+                    });
+                  },
                 ),
               ),
 
@@ -388,17 +306,38 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
 
   // ================= PRESET BUTTON =================
   Widget buildButton(String text, int sec) {
+    final isSelected = selectedDurationSeconds == sec;
+
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: ElevatedButton(
         style: ElevatedButton.styleFrom(
-          backgroundColor: const Color(0xFF1E1B48),
+          backgroundColor: isSelected
+              ? Colors.blueAccent
+              : const Color(0xFF1E1B48),
           minimumSize: const Size(double.infinity, 50),
         ),
-        onPressed: isLocked ? null : () => sendTimer(sec),
+        onPressed: () {
+          setState(() {
+            selectedDurationSeconds = sec;
+          });
+        },
         child: Text(text, style: const TextStyle(color: Colors.white)),
       ),
     );
+  }
+
+  String _formatDuration(int seconds) {
+    final duration = Duration(seconds: seconds);
+    final hours = duration.inHours.toString().padLeft(2, '0');
+    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final remainingSeconds = duration.inSeconds
+        .remainder(60)
+        .toString()
+        .padLeft(2, '0');
+    return hours == '00'
+        ? '$minutes:$remainingSeconds'
+        : '$hours:$minutes:$remainingSeconds';
   }
 
   // ================= UI =================
@@ -406,7 +345,11 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF0B0731),
-      appBar: AppBar(backgroundColor: Colors.transparent, elevation: 0),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: SingleChildScrollView(
@@ -420,6 +363,36 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
               ),
 
               const SizedBox(height: 30),
+
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E1B48),
+                  borderRadius: BorderRadius.circular(15),
+                ),
+                child: Column(
+                  children: [
+                    const Text(
+                      "Selected Timer",
+                      style: TextStyle(color: Colors.white70),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      selectedDurationSeconds == null
+                          ? "No timer selected"
+                          : _formatDuration(selectedDurationSeconds!),
+                      style: GoogleFonts.poppins(
+                        color: Colors.white,
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              const SizedBox(height: 20),
 
               buildLevelSlider(),
 
@@ -448,92 +421,42 @@ class _SetTimerScreenState extends State<SetTimerScreen> {
 
               const SizedBox(height: 10),
 
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.white,
-                    foregroundColor: Colors.black,
-                    minimumSize: const Size(double.infinity, 50),
-                  ),
-                  onPressed: isLocked ? null : showCustomTimeDialog,
-                  child: const Text("Custom Timer"),
-                ),
-              ),
-
-              const SizedBox(height: 20),
-
-              if (isLocked)
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1E1B48),
-                    borderRadius: BorderRadius.circular(15),
-                  ),
-                  child: Column(
-                    children: [
-                      const Text(
-                        "Timer Running",
-                        style: TextStyle(color: Colors.white70, fontSize: 14),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        Duration(
-                          seconds: remainingSeconds,
-                        ).toString().split('.').first,
-                        style: GoogleFonts.poppins(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-
-              if (isLocked)
-                Padding(
-                  padding: const EdgeInsets.only(top: 12),
-                  child: SizedBox(
-                    width: double.infinity,
+              Row(
+                children: [
+                  Expanded(
                     child: ElevatedButton(
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.red,
+                        backgroundColor: Colors.white,
+                        foregroundColor: Colors.black,
+                        minimumSize: const Size(double.infinity, 50),
                       ),
-                      onPressed: () async {
-                        countdownTimer?.cancel();
-                        autoFinishTimer?.cancel();
-
-                        await BLEManager.instance.send("OFF");
-
-                        final actualDuration =
-                            originalDuration - remainingSeconds;
-
-                        if (currentLogId != null) {
-                          await FirebaseFirestore.instance
-                              .collection("vibrator_logs")
-                              .doc(currentLogId)
-                              .update({
-                                "status": "cancelled",
-                                "duration": actualDuration,
-                                "actual_duration": actualDuration,
-                                "actual_end_time": Timestamp.now(),
-                              });
-                        }
-
-                        setState(() {
-                          isLocked = false;
-                          remainingSeconds = 0;
-                        });
-                      },
-                      child: const Text(
-                        "STOP TIMER",
-                        style: TextStyle(color: Colors.white),
-                      ),
+                      onPressed: showCustomTimeDialog,
+                      child: const Text("Custom Timer"),
                     ),
                   ),
-                ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.blueAccent,
+                        foregroundColor: Colors.white,
+                        minimumSize: const Size(double.infinity, 50),
+                      ),
+                      onPressed: selectedDurationSeconds == null
+                          ? null
+                          : () => Navigator.pop(
+                              context,
+                              SessionTimerSettings(
+                                durationSeconds: selectedDurationSeconds!,
+                                vibrationLevel: selectedLevel,
+                                heatLevel: heatLevel,
+                              ),
+                            ),
+                      child: const Text("Save"),
+                    ),
+                  ),
+                ],
+              ),
 
               const SizedBox(height: 20),
 

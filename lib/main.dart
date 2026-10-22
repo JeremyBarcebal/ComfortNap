@@ -74,7 +74,12 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
   String? activeSessionDocId;
   double currentSessionLevel = 0.5;
   bool isSessionRunning = false;
-  Timer? sessionTimer;
+  bool _heaterSafetyFaultActive = false;
+  int? selectedSessionDurationSeconds;
+  int? _remainingSessionSeconds;
+  Timer? sessionCountdownTimer;
+  bool _isStoppingSession = false;
+  OverlayEntry? _sessionNoticeEntry;
 
   // ===== AUDIO =====
   final AudioPlayer _audioPlayer = AudioPlayer();
@@ -104,6 +109,37 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
           pillowTemperature = temp;
           hasPillowTemperature = true;
         });
+      }
+    });
+
+    BLEManager.instance.heaterSafetyStream.listen((fault) {
+      if (!mounted) return;
+
+      if (fault == "CLEARED") {
+        setState(() {
+          _heaterSafetyFaultActive = false;
+        });
+        _showSessionMessageSnackBar(
+          "Heat pad is cool and the temperature sensor is working. Start a new session to use heat.",
+        );
+        return;
+      }
+
+      setState(() {
+        _heaterSafetyFaultActive = true;
+      });
+
+      final message = switch (fault) {
+        "OVER_TEMPERATURE" =>
+          "Heat pad overheated. Heating is off until it cools below 45°C.",
+        "SENSOR_ERROR" =>
+          "Heat pad temperature sensor error. Heating is off until safe readings return.",
+        _ => "Heat pad safety fault. Heating is off while the fault is active.",
+      };
+      _showSessionMessageSnackBar(message);
+
+      if (activeSessionDocId != null) {
+        unawaited(_stopSession());
       }
     });
 
@@ -176,9 +212,204 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
           "duration": duration,
           "final_vibration_level": (currentSessionLevel * 100).round(),
           "final_heat_level": heatLevel.round(),
+          if (hasPillowTemperature)
+            "final_pillow_temperature": pillowTemperature,
         });
 
     activeSessionDocId = null;
+  }
+
+  void _showSessionMessageSnackBar(String message) {
+    _showCenterSessionNotice(message: message);
+  }
+
+  void _showStopSessionConfirmation() {
+    _showCenterSessionNotice(
+      message: "Stopping session?",
+      onOkay: _stopSession,
+      showCancel: true,
+    );
+  }
+
+  void _showCenterSessionNotice({
+    required String message,
+    Future<void> Function()? onOkay,
+    bool showCancel = false,
+  }) {
+    _dismissSessionNotice();
+
+    final overlay = Overlay.of(context, rootOverlay: true);
+    late final OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (context) => Material(
+        color: Colors.black38,
+        child: Center(
+          child: Container(
+            width: (MediaQuery.sizeOf(context).width - 48)
+                .clamp(0, 360)
+                .toDouble(),
+            padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1E1B48),
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: const [
+                BoxShadow(
+                  color: Colors.black38,
+                  blurRadius: 24,
+                  offset: Offset(0, 10),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  showCancel ? Icons.help_outline : Icons.check_circle_outline,
+                  color: Colors.cyanAccent,
+                  size: 36,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.poppins(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    if (showCancel)
+                      TextButton(
+                        onPressed: _dismissSessionNotice,
+                        child: const Text(
+                          "Cancel",
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    TextButton(
+                      onPressed: () async {
+                        _dismissSessionNotice();
+                        await onOkay?.call();
+                      },
+                      child: const Text(
+                        "Okay",
+                        style: TextStyle(color: Colors.cyanAccent),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    _sessionNoticeEntry = entry;
+    overlay.insert(entry);
+  }
+
+  void _dismissSessionNotice() {
+    final entry = _sessionNoticeEntry;
+    _sessionNoticeEntry = null;
+    if (entry != null) {
+      entry.remove();
+      entry.dispose();
+    }
+  }
+
+  Future<void> _stopSession() async {
+    if (activeSessionDocId == null ||
+        sessionStartTime == null ||
+        _isStoppingSession) {
+      return;
+    }
+
+    _isStoppingSession = true;
+    sessionCountdownTimer?.cancel();
+    try {
+      await BLEManager.instance.send("OFF");
+      await BLEManager.instance.send("HEAT:0");
+
+      final endTime = DateTime.now();
+      final duration = endTime.difference(sessionStartTime!).inSeconds;
+
+      await FirebaseFirestore.instance
+          .collection("vibrator_logs")
+          .doc(activeSessionDocId)
+          .update({
+            "status": "ended",
+            "end_time": Timestamp.fromDate(endTime),
+            "duration": duration,
+            "final_vibration_level": (currentSessionLevel * 100).round(),
+            "final_heat_level": heatLevel.round(),
+            if (hasPillowTemperature)
+              "final_pillow_temperature": pillowTemperature,
+          });
+
+      activeSessionDocId = null;
+
+      if (mounted) {
+        setState(() {
+          isSessionRunning = false;
+          _remainingSessionSeconds = selectedSessionDurationSeconds;
+        });
+      }
+    } finally {
+      _isStoppingSession = false;
+    }
+  }
+
+  void _startSessionCountdown() {
+    sessionCountdownTimer?.cancel();
+    final duration = selectedSessionDurationSeconds;
+    _remainingSessionSeconds = duration;
+    if (duration == null) return;
+
+    sessionCountdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted || !isSessionRunning) {
+        timer.cancel();
+        return;
+      }
+
+      final remaining = _remainingSessionSeconds ?? 0;
+      if (remaining <= 1) {
+        timer.cancel();
+        setState(() {
+          _remainingSessionSeconds = 0;
+        });
+        unawaited(_finishTimedSession());
+        return;
+      }
+
+      setState(() {
+        _remainingSessionSeconds = remaining - 1;
+      });
+    });
+  }
+
+  Future<void> _finishTimedSession() async {
+    await _stopSession();
+    if (mounted && !isSessionRunning) {
+      _showSessionMessageSnackBar("Session timer completed");
+    }
+  }
+
+  String _formatSessionDuration(int seconds) {
+    final duration = Duration(seconds: seconds);
+    final hours = duration.inHours.toString().padLeft(2, "0");
+    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, "0");
+    final remainingSeconds = duration.inSeconds
+        .remainder(60)
+        .toString()
+        .padLeft(2, "0");
+    return hours == "00"
+        ? "$minutes:$remainingSeconds"
+        : "$hours:$minutes:$remainingSeconds";
   }
 
   Future<void> _playSelectedSound() async {
@@ -195,87 +426,10 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
     }
   }
 
-  void startOneHourCheck() {
-    sessionTimer?.cancel();
-
-    sessionTimer = Timer(const Duration(seconds: 10), () {
-      if (!mounted || !isSessionRunning) return;
-
-      _showExtendSessionDialog();
-    });
-  }
-
-  void _showExtendSessionDialog() {
-    bool handled = false;
-
-    Timer(const Duration(seconds: 10), () async {
-      if (handled) return;
-
-      handled = true;
-
-      Navigator.of(context, rootNavigator: true).pop();
-
-      await BLEManager.instance.send("OFF");
-
-      setState(() {
-        isSessionRunning = false;
-      });
-
-      await endCurrentSession();
-      await saveSleepSession();
-    });
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text("Session Complete"),
-          content: const Text("Extend session?\n\nAuto NO in 10 seconds."),
-          actions: [
-            TextButton(
-              onPressed: () {
-                if (handled) return;
-
-                handled = true;
-
-                Navigator.pop(context);
-
-                startOneHourCheck();
-
-                // ❌ DO NOT save sleep here (still session continues)
-              },
-              child: const Text("YES"),
-            ),
-
-            TextButton(
-              onPressed: () async {
-                if (handled) return;
-
-                handled = true;
-
-                Navigator.pop(context);
-
-                await BLEManager.instance.send("OFF");
-
-                setState(() {
-                  isSessionRunning = false;
-                });
-
-                // ✅ USER ENDS SESSION → SAVE SLEEP
-                await endCurrentSession();
-                await saveSleepSession();
-              },
-              child: const Text("NO"),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
   @override
   void dispose() {
+    sessionCountdownTimer?.cancel();
+    _dismissSessionNotice();
     _audioPlayer.dispose();
     super.dispose();
   }
@@ -436,7 +590,8 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
                                   heatLevel = selectedHeat;
                                 });
 
-                                if (BLEManager.instance.connected) {
+                                if (isSessionRunning &&
+                                    BLEManager.instance.connected) {
                                   await BLEManager.instance.send(
                                     "HEAT:${selectedHeat.round()}",
                                   );
@@ -563,11 +718,37 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
 
                 // ================= TIMER =================
                 GestureDetector(
-                  onTap: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (context) => SetTimerScreen()),
-                    );
+                  onTap: () async {
+                    if (isSessionRunning) {
+                      _showSessionMessageSnackBar(
+                        "Stop the current session before changing its timer.",
+                      );
+                      return;
+                    }
+
+                    final timerSettings =
+                        await Navigator.push<SessionTimerSettings>(
+                          context,
+                          MaterialPageRoute(
+                            builder: (context) => SetTimerScreen(
+                              initialVibrationLevel: currentSessionLevel,
+                              initialHeatLevel: heatLevel,
+                              initialDurationSeconds:
+                                  selectedSessionDurationSeconds,
+                            ),
+                          ),
+                        );
+                    if (timerSettings != null && mounted) {
+                      setState(() {
+                        selectedSessionDurationSeconds =
+                            timerSettings.durationSeconds;
+                        _remainingSessionSeconds =
+                            timerSettings.durationSeconds;
+                        currentSessionLevel = timerSettings.vibrationLevel;
+                        vibrationLevel = timerSettings.vibrationLevel;
+                        heatLevel = timerSettings.heatLevel;
+                      });
+                    }
                   },
                   child: Container(
                     padding: const EdgeInsets.all(12),
@@ -594,9 +775,27 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
 
                         const Spacer(),
 
+                        Text(
+                          selectedSessionDurationSeconds == null
+                              ? "No timer"
+                              : _formatSessionDuration(
+                                  isSessionRunning
+                                      ? (_remainingSessionSeconds ??
+                                            selectedSessionDurationSeconds!)
+                                      : selectedSessionDurationSeconds!,
+                                ),
+                          style: GoogleFonts.poppins(
+                            color: Colors.cyanAccent,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+
+                        const SizedBox(width: 10),
+
                         const Icon(
                           Icons.arrow_forward_ios,
-                          color: Colors.yellow,
+                          color: Colors.white,
                         ),
                       ],
                     ),
@@ -619,36 +818,85 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
                     ),
 
                     onPressed: () async {
-                      if (!bleConnected) return;
+                      if (isSessionRunning) return;
 
-                      sessionStartTime = DateTime.now();
+                      if (selectedSessionDurationSeconds == null) {
+                        _showSessionMessageSnackBar(
+                          "Select and save a timer before starting.",
+                        );
+                        return;
+                      }
 
-                      await BLEManager.instance.send("ON");
-                      await BLEManager.instance.send(
-                        "HEAT:${heatLevel.round()}",
-                      );
+                      if (!bleConnected) {
+                        _showSessionMessageSnackBar(
+                          "Connect to the device before starting a session.",
+                        );
+                        return;
+                      }
 
-                      final docRef = await FirebaseFirestore.instance
-                          .collection("vibrator_logs")
-                          .add({
-                            "type": "session",
-                            "status": "running",
-                            "start_time": Timestamp.fromDate(sessionStartTime!),
-                            "vibration_level": (currentSessionLevel * 100)
-                                .round(),
-                            "heat_level": heatLevel.round(),
-                            "timestamp": FieldValue.serverTimestamp(),
-                          });
+                      if (_heaterSafetyFaultActive) {
+                        _showSessionMessageSnackBar(
+                          "Heat pad safety lockout. Wait for the pad to cool and the sensor to report safe readings.",
+                        );
+                        return;
+                      }
 
-                      activeSessionDocId = docRef.id;
+                      String? newSessionDocId;
+                      try {
+                        final startTime = DateTime.now();
+                        final docRef = await FirebaseFirestore.instance
+                            .collection("vibrator_logs")
+                            .add({
+                              "type": "session",
+                              "status": "running",
+                              "start_time": Timestamp.fromDate(startTime),
+                              "vibration_level": (currentSessionLevel * 100)
+                                  .round(),
+                              "heat_level": heatLevel.round(),
+                              "timestamp": FieldValue.serverTimestamp(),
+                            });
+                        newSessionDocId = docRef.id;
 
-                      setState(() {
-                        isSessionRunning = true;
-                      });
+                        await BLEManager.instance.send(
+                          "VIB:${(currentSessionLevel * 100).round()}",
+                        );
+                        await BLEManager.instance.send(
+                          "HEAT:${heatLevel.round()}",
+                        );
+                        await BLEManager.instance.send("ON");
+                        if (_heaterSafetyFaultActive) {
+                          throw StateError("Heat pad safety lockout detected.");
+                        }
 
-                      startOneHourCheck();
+                        sessionStartTime = DateTime.now();
+                        activeSessionDocId = newSessionDocId;
 
-                      print("ACTIVE SESSION: $activeSessionDocId");
+                        setState(() {
+                          isSessionRunning = true;
+                        });
+
+                        _startSessionCountdown();
+                        _showSessionMessageSnackBar("Session started");
+
+                        print("ACTIVE SESSION: $activeSessionDocId");
+                      } catch (error) {
+                        await BLEManager.instance.send("OFF");
+                        await BLEManager.instance.send("HEAT:0");
+
+                        if (newSessionDocId != null) {
+                          await FirebaseFirestore.instance
+                              .collection("vibrator_logs")
+                              .doc(newSessionDocId)
+                              .update({"status": "failed"});
+                        }
+
+                        activeSessionDocId = null;
+                        if (mounted) {
+                          _showSessionMessageSnackBar(
+                            "Session could not start: $error",
+                          );
+                        }
+                      }
                     },
 
                     child: Text(
@@ -677,45 +925,13 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
                     ),
 
                     onPressed: () async {
-                      sessionTimer?.cancel();
-
-                      // ALWAYS STOP MOTOR FIRST
-                      await BLEManager.instance.send("OFF");
-
-                      if (activeSessionDocId == null) {
-                        print("No active session");
+                      if (activeSessionDocId == null ||
+                          sessionStartTime == null) {
+                        _showSessionMessageSnackBar("No active session");
                         return;
                       }
 
-                      final endTime = DateTime.now();
-
-                      final duration = endTime
-                          .difference(sessionStartTime!)
-                          .inSeconds;
-
-                      await FirebaseFirestore.instance
-                          .collection("vibrator_logs")
-                          .doc(activeSessionDocId)
-                          .update({
-                            "status": "ended",
-                            "end_time": Timestamp.fromDate(endTime),
-                            "duration": duration,
-
-                            // 🔥 final vibration level — must be 0-100 to match
-                            // "vibration_level" saved at start (was previously
-                            // saved as a raw 0-1 double, which displayed wrong)
-                            "final_vibration_level": (currentSessionLevel * 100)
-                                .round(),
-                            "final_heat_level": heatLevel.round(),
-                          });
-
-                      print("SESSION UPDATED");
-
-                      activeSessionDocId = null;
-
-                      setState(() {
-                        isSessionRunning = false;
-                      });
+                      _showStopSessionConfirmation();
                     },
                     child: Text(
                       "Stop Session",

@@ -354,20 +354,19 @@ class _SleepSessionScreenState extends State<SleepSessionScreen> {
     // ================= VIBRATION / HEAT LEVELS =================
     final vibrationStart = data["vibration_level"];
     final vibrationEnd = data["final_vibration_level"];
-    final heatStart = data["heat_level"];
-    final heatEnd = data["final_heat_level"];
+    final heatSetting = data["heat_level"];
+    final pillowTemperature = data["final_pillow_temperature"];
 
     String vibrationText = vibrationStart == null
         ? "-"
         : vibrationEnd == null
-            ? "$vibrationStart%"
-            : "$vibrationStart% → $vibrationEnd%";
+        ? "$vibrationStart%"
+        : "$vibrationStart% → $vibrationEnd%";
 
-    String heatText = heatStart == null
+    final heatSettingText = heatSetting == null ? "-" : "$heatSetting%";
+    final pillowTemperatureText = pillowTemperature == null
         ? "-"
-        : heatEnd == null
-            ? "$heatStart°C"
-            : "$heatStart°C → $heatEnd°C";
+        : "${(pillowTemperature as num).toStringAsFixed(1)}°C";
 
     return Dismissible(
       key: Key(doc.id),
@@ -426,7 +425,13 @@ class _SleepSessionScreenState extends State<SleepSessionScreen> {
 
             buildInfoRow(Icons.vibration, "Vibration Level", vibrationText),
 
-            buildInfoRow(Icons.thermostat, "Heat Level", heatText),
+            buildInfoRow(Icons.thermostat, "Heat Setting", heatSettingText),
+
+            buildInfoRow(
+              Icons.device_thermostat,
+              "Pillow Temperature",
+              pillowTemperatureText,
+            ),
           ],
         ),
       ),

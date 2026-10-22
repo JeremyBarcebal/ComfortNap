@@ -140,15 +140,8 @@ class BLEManager {
 
   BluetoothDevice? _device;
   BluetoothCharacteristic? _rx;
-  BluetoothCharacteristic? _tx;
 
   bool connected = false;
-
-  Function? _extendCallback;
-
-  void setExtendCallback(Function cb) {
-    _extendCallback = cb;
-  }
 
   // ================= STREAMS =================
   final _stream = StreamController<bool>.broadcast();
@@ -159,6 +152,9 @@ class BLEManager {
 
   final _temperatureStream = StreamController<double>.broadcast();
   Stream<double> get temperatureStream => _temperatureStream.stream;
+
+  final _heaterSafetyStream = StreamController<String>.broadcast();
+  Stream<String> get heaterSafetyStream => _heaterSafetyStream.stream;
 
   // ================= UUID =================
   static const serviceUUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
@@ -185,20 +181,13 @@ class BLEManager {
         for (var c in s.characteristics) {
           // ================= TX (NOTIFY FROM ESP32) =================
           if (c.uuid.toString().toUpperCase() == txUUID) {
-            _tx = c;
             await c.setNotifyValue(true);
 
             c.value.listen((data) {
               final msg = utf8.decode(data).trim();
               print("ESP32: $msg");
 
-              // ================= EXTEND REQUEST =================
-              if (msg == "EXTEND_REQUEST") {
-                _extendCallback?.call();
-              }
-              // ================= PILLOW TEMPERATURE =================
-              else if (msg.startsWith("TEMP:") ||
-                  msg.startsWith("PILLOW_TEMP:")) {
+              if (msg.startsWith("TEMP:") || msg.startsWith("PILLOW_TEMP:")) {
                 final raw = msg.contains(":")
                     ? msg.split(":").sublist(1).join(":")
                     : msg;
@@ -209,6 +198,10 @@ class BLEManager {
                 } catch (_) {
                   print("INVALID TEMP PAYLOAD: $msg");
                 }
+              }
+              // ================= HEATER SAFETY =================
+              else if (msg.startsWith("SAFETY:")) {
+                _heaterSafetyStream.add(msg.substring("SAFETY:".length));
               }
               // ================= SLEEP DATA =================
               else if (msg.startsWith("SLEEP:")) {
@@ -248,7 +241,6 @@ class BLEManager {
 
     _device = null;
     _rx = null;
-    _tx = null;
   }
 
   // ================= CLEANUP =================
@@ -256,5 +248,6 @@ class BLEManager {
     _stream.close();
     _sleepStream.close();
     _temperatureStream.close();
+    _heaterSafetyStream.close();
   }
 }

@@ -23,7 +23,10 @@ class _BleHomePageState extends State<BleHomePage> {
   final List<String> _log = [];
 
   StreamSubscription<List<ScanResult>>? _scanSub;
+  StreamSubscription<bool>? _scanningSub;
   bool _scanning = false;
+  bool _connecting = false;
+  bool _disposed = false;
 
   // ================= PERMISSIONS =================
   Future<void> _ensurePermissions() async {
@@ -38,18 +41,28 @@ class _BleHomePageState extends State<BleHomePage> {
   }
 
   // ================= SCAN =================
-  void _startScan() async {
+  Future<void> _startScan() async {
+    if (!mounted || _disposed) return;
+
+    await _scanSub?.cancel();
+    _scanSub = null;
+    await _scanningSub?.cancel();
+    _scanningSub = null;
+    if (!mounted || _disposed) return;
+
     setState(() {
       _scanResults.clear();
       _scanning = true;
     });
 
     await _ensurePermissions();
+    if (!mounted || _disposed) return;
 
-    FlutterBluePlus.stopScan();
-    FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
+    await FlutterBluePlus.stopScan();
+    if (!mounted || _disposed) return;
 
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
+      if (!mounted || _disposed) return;
       setState(() {
         _scanResults
           ..clear()
@@ -57,35 +70,47 @@ class _BleHomePageState extends State<BleHomePage> {
       });
     });
 
-    FlutterBluePlus.isScanning.listen((s) {
+    _scanningSub = FlutterBluePlus.isScanning.listen((s) {
+      if (!mounted || _disposed) return;
       setState(() => _scanning = s);
     });
+
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
   }
 
   // ================= CONNECT =================
   Future<void> _connect(ScanResult r) async {
+    if (_connecting) return;
+    setState(() => _connecting = true);
     _addLog("Connecting → ${r.device.name}");
     try {
       await BLEManager.instance.connect(r.device);
+      if (!mounted) return;
       _addLog("Connected ✔ ${r.device.name}");
 
       // Report the connected device back to whoever pushed this screen
       // (main.dart awaits this to know when to update ble_status).
-      if (mounted) {
-        Navigator.pop(context, r.device);
-      }
+      Navigator.pop(context, r.device);
     } catch (e) {
       _addLog("Failed ❌ $e");
+    } finally {
+      if (mounted) {
+        setState(() => _connecting = false);
+      }
     }
   }
 
   void _addLog(String msg) {
+    if (!mounted) return;
     setState(() => _log.insert(0, msg));
   }
 
   @override
   void dispose() {
-    _scanSub?.cancel();
+    _disposed = true;
+    unawaited(_scanSub?.cancel());
+    unawaited(_scanningSub?.cancel());
+    unawaited(FlutterBluePlus.stopScan());
     super.dispose();
   }
 
@@ -138,7 +163,7 @@ class _BleHomePageState extends State<BleHomePage> {
           ),
 
           ElevatedButton(
-            onPressed: () => _connect(r),
+            onPressed: _connecting ? null : () => _connect(r),
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.blueAccent,
               foregroundColor: Colors.white,
