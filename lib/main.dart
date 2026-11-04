@@ -78,6 +78,8 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
   int? selectedSessionDurationSeconds;
   int? _remainingSessionSeconds;
   Timer? sessionCountdownTimer;
+  Timer? _extensionResponseTimer;
+  bool _isAwaitingExtensionResponse = false;
   bool _isStoppingSession = false;
   OverlayEntry? _sessionNoticeEntry;
 
@@ -172,23 +174,26 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
     });
   }
 
-  Future<void> saveSleepSession() async {
+  Future<void> saveSleepSession({DateTime? endTimeOverride}) async {
     if (sessionStartTime == null) return;
 
-    final endTime = DateTime.now();
-
+    final endTime = endTimeOverride ?? DateTime.now();
     final durationSeconds = endTime.difference(sessionStartTime!).inSeconds;
     final durationMinutes = (durationSeconds / 60).round();
 
     await FirebaseFirestore.instance.collection("vibrator_logs").add({
       "type": "sleep",
+      "session_doc_id": activeSessionDocId,
       "sleep_start": Timestamp.fromDate(sessionStartTime!),
       "sleep_end": Timestamp.fromDate(endTime),
+      "sleep_duration_seconds": durationSeconds,
 
       // Must match "sleep_duration_minutes" — that's the field every
       // reader (MonthlySleepScreen, data.dart's buildSleepCard) looks for.
       "sleep_duration_minutes": durationMinutes,
-
+      "timer_duration_seconds": selectedSessionDurationSeconds ?? 0,
+      "timer_remaining_seconds_at_wake":
+          _remainingSessionSeconds ?? selectedSessionDurationSeconds ?? 0,
       "status": "completed",
       "timestamp": FieldValue.serverTimestamp(),
     });
@@ -235,6 +240,8 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
     required String message,
     Future<void> Function()? onOkay,
     bool showCancel = false,
+    Future<void> Function()? onYes,
+    Future<void> Function()? onNo,
   }) {
     _dismissSessionNotice();
 
@@ -264,7 +271,9 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Icon(
-                  showCancel ? Icons.help_outline : Icons.check_circle_outline,
+                  showCancel || onYes != null
+                      ? Icons.help_outline
+                      : Icons.check_circle_outline,
                   color: Colors.cyanAccent,
                   size: 36,
                 ),
@@ -282,24 +291,47 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    if (showCancel)
+                    if (onYes != null && onNo != null) ...[
                       TextButton(
-                        onPressed: _dismissSessionNotice,
+                        onPressed: () async {
+                          _dismissSessionNotice();
+                          await onNo();
+                        },
                         child: const Text(
-                          "Cancel",
+                          "No",
                           style: TextStyle(color: Colors.white70),
                         ),
                       ),
-                    TextButton(
-                      onPressed: () async {
-                        _dismissSessionNotice();
-                        await onOkay?.call();
-                      },
-                      child: const Text(
-                        "Okay",
-                        style: TextStyle(color: Colors.cyanAccent),
+                      TextButton(
+                        onPressed: () async {
+                          _dismissSessionNotice();
+                          await onYes();
+                        },
+                        child: const Text(
+                          "Yes",
+                          style: TextStyle(color: Colors.cyanAccent),
+                        ),
                       ),
-                    ),
+                    ] else ...[
+                      if (showCancel)
+                        TextButton(
+                          onPressed: _dismissSessionNotice,
+                          child: const Text(
+                            "Cancel",
+                            style: TextStyle(color: Colors.white70),
+                          ),
+                        ),
+                      TextButton(
+                        onPressed: () async {
+                          _dismissSessionNotice();
+                          await onOkay?.call();
+                        },
+                        child: const Text(
+                          "Okay",
+                          style: TextStyle(color: Colors.cyanAccent),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ],
@@ -331,6 +363,10 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
 
     _isStoppingSession = true;
     sessionCountdownTimer?.cancel();
+    _extensionResponseTimer?.cancel();
+    _extensionResponseTimer = null;
+    _isAwaitingExtensionResponse = false;
+    _dismissSessionNotice();
     try {
       await BLEManager.instance.send("OFF");
       await BLEManager.instance.send("HEAT:0");
@@ -382,7 +418,7 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
         setState(() {
           _remainingSessionSeconds = 0;
         });
-        unawaited(_finishTimedSession());
+        _askToExtendSession();
         return;
       }
 
@@ -392,10 +428,160 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
     });
   }
 
+  void _askToExtendSession() {
+    if (_isAwaitingExtensionResponse || !isSessionRunning) return;
+
+    _isAwaitingExtensionResponse = true;
+    _showCenterSessionNotice(
+      message: "Do you want to extend your session? You have 10 seconds.",
+      onYes: () => _respondToExtension(extend: true),
+      onNo: () => _respondToExtension(extend: false),
+    );
+    _extensionResponseTimer?.cancel();
+    _extensionResponseTimer = Timer(
+      const Duration(seconds: 10),
+      () => unawaited(_respondToExtension(extend: false)),
+    );
+  }
+
+  Future<void> _respondToExtension({required bool extend}) async {
+    if (!_isAwaitingExtensionResponse) return;
+
+    _isAwaitingExtensionResponse = false;
+    _extensionResponseTimer?.cancel();
+    _extensionResponseTimer = null;
+
+    if (extend && isSessionRunning) {
+      final duration = selectedSessionDurationSeconds;
+      if (duration == null) {
+        await _finishTimedSession();
+        return;
+      }
+
+      setState(() {
+        _remainingSessionSeconds = duration;
+      });
+      _startSessionCountdown();
+      _showSessionMessageSnackBar("Session extended");
+      return;
+    }
+
+    await _finishTimedSession();
+  }
+
   Future<void> _finishTimedSession() async {
     await _stopSession();
     if (mounted && !isSessionRunning) {
       _showSessionMessageSnackBar("Session timer completed");
+    }
+  }
+
+  Future<void> _handleWakeSession() async {
+    if (activeSessionDocId == null || sessionStartTime == null) {
+      _showSessionMessageSnackBar("No active session");
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1B48),
+        title: Text(
+          "Are you already awake?",
+          style: GoogleFonts.poppins(color: Colors.white),
+        ),
+        content: Text(
+          "This will record your actual wake-up time and complete the session.",
+          style: GoogleFonts.poppins(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text(
+              "Cancel",
+              style: TextStyle(color: Colors.white70),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text(
+              "Yes",
+              style: TextStyle(color: Colors.cyanAccent),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
+    sessionCountdownTimer?.cancel();
+    _extensionResponseTimer?.cancel();
+    _extensionResponseTimer = null;
+    _isAwaitingExtensionResponse = false;
+
+    final wakeTime = DateTime.now();
+    final actualSleepSeconds = wakeTime.difference(sessionStartTime!).inSeconds;
+    final timerDurationSeconds = selectedSessionDurationSeconds ?? 0;
+    final remainingAtWakeSeconds =
+        _remainingSessionSeconds ?? selectedSessionDurationSeconds ?? 0;
+
+    try {
+      await BLEManager.instance.send("OFF");
+      await BLEManager.instance.send("HEAT:0");
+
+      await FirebaseFirestore.instance
+          .collection("vibrator_logs")
+          .doc(activeSessionDocId)
+          .update({
+            "status": "completed",
+            "wake_time": Timestamp.fromDate(wakeTime),
+            "end_time": Timestamp.fromDate(wakeTime),
+            "actual_sleep_duration_seconds": actualSleepSeconds,
+            "actual_sleep_duration_minutes": (actualSleepSeconds / 60).round(),
+            "actual_sleep_duration_display": _formatSessionDuration(
+              actualSleepSeconds,
+            ),
+            "timer_duration_seconds": timerDurationSeconds,
+            "timer_remaining_seconds_at_wake": remainingAtWakeSeconds,
+            "timer_remaining_duration_display": _formatSessionDuration(
+              remainingAtWakeSeconds,
+            ),
+            "final_vibration_level": (currentSessionLevel * 100).round(),
+            "final_heat_level": heatLevel.round(),
+            "final_pillow_temperature": hasPillowTemperature
+                ? pillowTemperature
+                : null,
+            "completed_at": FieldValue.serverTimestamp(),
+            "completion_reason": "manual_wake",
+          });
+
+      await saveSleepSession(endTimeOverride: wakeTime);
+
+      final actualSleepFormatted = _formatSessionDuration(actualSleepSeconds);
+
+      if (mounted) {
+        setState(() {
+          isSessionRunning = false;
+          _remainingSessionSeconds = remainingAtWakeSeconds;
+        });
+      }
+
+      _showSessionMessageSnackBar(
+        "Session completed. Actual sleep: $actualSleepFormatted",
+      );
+    } catch (error) {
+      if (mounted) {
+        _showSessionMessageSnackBar("Could not complete session: $error");
+      }
+      return;
+    } finally {
+      activeSessionDocId = null;
+      sessionStartTime = null;
+      _isAwaitingExtensionResponse = false;
+      _isStoppingSession = false;
     }
   }
 
@@ -429,6 +615,7 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
   @override
   void dispose() {
     sessionCountdownTimer?.cancel();
+    _extensionResponseTimer?.cancel();
     _dismissSessionNotice();
     _audioPlayer.dispose();
     super.dispose();
@@ -908,6 +1095,41 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
                     ),
                   ),
                 ),
+
+                if (isSessionRunning) ...[
+                  const SizedBox(height: 12),
+
+                  // ================= WAKE BUTTON =================
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                      ),
+                      onPressed: () async {
+                        if (activeSessionDocId == null ||
+                            sessionStartTime == null) {
+                          _showSessionMessageSnackBar("No active session");
+                          return;
+                        }
+
+                        await _handleWakeSession();
+                      },
+                      child: Text(
+                        "Wake",
+                        style: GoogleFonts.poppins(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
 
                 const SizedBox(height: 12),
 
