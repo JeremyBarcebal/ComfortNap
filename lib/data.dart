@@ -332,7 +332,10 @@ class _SleepSessionScreenState extends State<SleepSessionScreen> {
 
     final start = data["start_time"];
     final end = data["end_time"];
-    final duration = data["duration"] ?? 0;
+    final actualSeconds = data["actual_sleep_duration_seconds"] is num
+        ? (data["actual_sleep_duration_seconds"] as num).toInt()
+        : (data["duration"] ?? 0) as int;
+    final duration = actualSeconds <= 0 ? 1 : actualSeconds;
     final hours = duration ~/ 3600;
     final minutes = (duration % 3600) ~/ 60;
     final seconds = duration % 60;
@@ -540,7 +543,12 @@ class _SleepSessionScreenState extends State<SleepSessionScreen> {
 
     final start = data["sleep_start"];
     final end = data["sleep_end"];
-    final duration = data["sleep_duration_minutes"] ?? 0;
+    final actualSeconds = data["actual_sleep_duration_seconds"] is num
+        ? (data["actual_sleep_duration_seconds"] as num).toInt()
+        : ((data["sleep_duration_minutes"] ?? 0) * 60);
+    final durationMinutes = ((actualSeconds + 59) ~/ 60);
+    final hours = durationMinutes ~/ 60;
+    final minutes = durationMinutes % 60;
 
     DateTime? startTime = start is Timestamp ? start.toDate() : null;
 
@@ -579,7 +587,7 @@ class _SleepSessionScreenState extends State<SleepSessionScreen> {
             const SizedBox(height: 20),
 
             Text(
-              "${duration ~/ 60}h ${duration % 60}m",
+              "${hours}h ${minutes}m",
               style: const TextStyle(color: Colors.white, fontSize: 32),
             ),
 

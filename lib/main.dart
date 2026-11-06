@@ -179,14 +179,15 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
 
     final endTime = endTimeOverride ?? DateTime.now();
     final durationSeconds = endTime.difference(sessionStartTime!).inSeconds;
-    final durationMinutes = (durationSeconds / 60).round();
+    final safeDurationSeconds = durationSeconds <= 0 ? 1 : durationSeconds;
+    final durationMinutes = ((safeDurationSeconds + 59) ~/ 60);
 
     await FirebaseFirestore.instance.collection("vibrator_logs").add({
       "type": "sleep",
       "session_doc_id": activeSessionDocId,
       "sleep_start": Timestamp.fromDate(sessionStartTime!),
       "sleep_end": Timestamp.fromDate(endTime),
-      "sleep_duration_seconds": durationSeconds,
+      "sleep_duration_seconds": safeDurationSeconds,
 
       // Must match "sleep_duration_minutes" — that's the field every
       // reader (MonthlySleepScreen, data.dart's buildSleepCard) looks for.
@@ -428,6 +429,27 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
     });
   }
 
+  Future<void> _stopHardwareWithoutEndingSession() async {
+    if (!isSessionRunning) return;
+
+    sessionCountdownTimer?.cancel();
+    _extensionResponseTimer?.cancel();
+    _extensionResponseTimer = null;
+    _isAwaitingExtensionResponse = false;
+    _dismissSessionNotice();
+
+    try {
+      await BLEManager.instance.send("OFF");
+      await BLEManager.instance.send("HEAT:0");
+    } catch (_) {}
+
+    if (mounted) {
+      setState(() {
+        _remainingSessionSeconds = 0;
+      });
+    }
+  }
+
   void _askToExtendSession() {
     if (_isAwaitingExtensionResponse || !isSessionRunning) return;
 
@@ -438,10 +460,18 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
       onNo: () => _respondToExtension(extend: false),
     );
     _extensionResponseTimer?.cancel();
-    _extensionResponseTimer = Timer(
-      const Duration(seconds: 10),
-      () => unawaited(_respondToExtension(extend: false)),
-    );
+    _extensionResponseTimer = Timer(const Duration(seconds: 10), () async {
+      _isAwaitingExtensionResponse = false;
+      _extensionResponseTimer = null;
+      _dismissSessionNotice();
+
+      if (mounted && isSessionRunning) {
+        await _stopHardwareWithoutEndingSession();
+        _showSessionMessageSnackBar(
+          "Timer expired. Heat and vibration are off. Press Wake when you are awake.",
+        );
+      }
+    });
   }
 
   Future<void> _respondToExtension({required bool extend}) async {
@@ -454,7 +484,12 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
     if (extend && isSessionRunning) {
       final duration = selectedSessionDurationSeconds;
       if (duration == null) {
-        await _finishTimedSession();
+        await _stopHardwareWithoutEndingSession();
+        if (mounted) {
+          _showSessionMessageSnackBar(
+            "Timer expired. Heat and vibration are off. Press Wake when you are awake.",
+          );
+        }
         return;
       }
 
@@ -466,13 +501,11 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
       return;
     }
 
-    await _finishTimedSession();
-  }
-
-  Future<void> _finishTimedSession() async {
-    await _stopSession();
-    if (mounted && !isSessionRunning) {
-      _showSessionMessageSnackBar("Session timer completed");
+    await _stopHardwareWithoutEndingSession();
+    if (mounted) {
+      _showSessionMessageSnackBar(
+        "Timer expired. Heat and vibration are off. Press Wake when you are awake.",
+      );
     }
   }
 
@@ -524,6 +557,9 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
 
     final wakeTime = DateTime.now();
     final actualSleepSeconds = wakeTime.difference(sessionStartTime!).inSeconds;
+    final safeActualSleepSeconds = actualSleepSeconds <= 0
+        ? 1
+        : actualSleepSeconds;
     final timerDurationSeconds = selectedSessionDurationSeconds ?? 0;
     final remainingAtWakeSeconds =
         _remainingSessionSeconds ?? selectedSessionDurationSeconds ?? 0;
@@ -539,10 +575,12 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
             "status": "completed",
             "wake_time": Timestamp.fromDate(wakeTime),
             "end_time": Timestamp.fromDate(wakeTime),
-            "actual_sleep_duration_seconds": actualSleepSeconds,
-            "actual_sleep_duration_minutes": (actualSleepSeconds / 60).round(),
+            "duration": safeActualSleepSeconds,
+            "actual_sleep_duration_seconds": safeActualSleepSeconds,
+            "actual_sleep_duration_minutes":
+                ((safeActualSleepSeconds + 59) ~/ 60),
             "actual_sleep_duration_display": _formatSessionDuration(
-              actualSleepSeconds,
+              safeActualSleepSeconds,
             ),
             "timer_duration_seconds": timerDurationSeconds,
             "timer_remaining_seconds_at_wake": remainingAtWakeSeconds,
@@ -560,7 +598,9 @@ class _ComfortNapScreenState extends State<ComfortNapScreen> {
 
       await saveSleepSession(endTimeOverride: wakeTime);
 
-      final actualSleepFormatted = _formatSessionDuration(actualSleepSeconds);
+      final actualSleepFormatted = _formatSessionDuration(
+        safeActualSleepSeconds,
+      );
 
       if (mounted) {
         setState(() {
